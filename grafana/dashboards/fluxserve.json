@@ -1,0 +1,157 @@
+{
+  "uid": "fluxserve-main",
+  "title": "FluxServe",
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-5m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(fluxserve_requests_total{status=\"ok\"}[1m])",
+          "legendFormat": "ok"
+        },
+        {
+          "expr": "rate(fluxserve_requests_total{status=\"cached\"}[1m])",
+          "legendFormat": "cached"
+        },
+        {
+          "expr": "rate(fluxserve_requests_total{status=\"rate_limited\"}[1m])",
+          "legendFormat": "rate_limited"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Inference Latency (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(fluxserve_inference_latency_seconds_bucket[1m])) * 1000",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(fluxserve_inference_latency_seconds_bucket[1m])) * 1000",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(fluxserve_inference_latency_seconds_bucket[1m])) * 1000",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "fluxserve_queue_depth",
+          "legendFormat": "queue depth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Active Sequences",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "fluxserve_active_sequences",
+          "legendFormat": "active sequences"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    },
+    {
+      "id": 5,
+      "title": "KV Cache Utilization",
+      "type": "gauge",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "fluxserve_kv_cache_utilization * 100",
+          "legendFormat": "utilization %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "GPU Memory Used (GB)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 15, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "fluxserve_gpu_memory_used_gb",
+          "legendFormat": "GPU memory GB"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decgbytes" }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Tokens per Second",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 15, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "fluxserve_tokens_per_second",
+          "legendFormat": "tokens/sec"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Avg Batch Size",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 15, "w": 8, "h": 7 },
+      "targets": [
+        {
+          "expr": "rate(fluxserve_batch_size_sum[1m]) / rate(fluxserve_batch_size_count[1m])",
+          "legendFormat": "avg batch size"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    }
+  ]
+}

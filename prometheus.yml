@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'fluxserve'
+    static_configs:
+      - targets: ['inference-server:8000']

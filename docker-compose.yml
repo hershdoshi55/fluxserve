@@ -1,0 +1,49 @@
+services:
+  inference-server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - API_KEY=dev-key
+      - REDIS_HOST=redis
+      - PRECISION=fp16
+      - MAX_BATCH_SIZE=8
+      - MAX_WAIT_MS=20
+      - QUEUE_MAX_DEPTH=256
+    volumes:
+      # Reuse host model cache — avoids re-downloading Qwen2.5-0.5B on every start
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - redis
+    shm_size: '1gb'
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus

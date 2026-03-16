@@ -6,6 +6,8 @@ from typing import Optional
 
 class ResponseCache:
     def __init__(self, host: str = "localhost", port: int = 6379, ttl: int = 3600):
+        import os
+        host = os.getenv("REDIS_HOST", host)
         self.client = redis.Redis(host=host, port=port, decode_responses=True)
         self.ttl = ttl
 
