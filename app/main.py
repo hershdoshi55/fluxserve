@@ -15,7 +15,7 @@ import uuid
 
 queue_manager = QueueManager(max_depth=int(os.getenv("QUEUE_MAX_DEPTH", "256")))
 cache = ResponseCache()
-batch_worker: BatchWorker = None
+batch_worker: BatchWorker | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
