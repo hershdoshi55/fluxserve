@@ -1,6 +1,6 @@
-# load_tests/locustfile.py
 from locust import HttpUser, task, between
 import random
+import itertools
 
 SAMPLE_TEXTS = [
     "I love this community and everyone in it!",
@@ -15,6 +15,9 @@ SAMPLE_TEXTS = [
     "Why do you exist? You ruin everything",
 ]
 
+_counter = itertools.count()
+
+
 class ModerateUser(HttpUser):
     wait_time = between(0.1, 0.5)
 
@@ -23,7 +26,7 @@ class ModerateUser(HttpUser):
 
     @task
     def moderate(self):
-        text = random.choice(SAMPLE_TEXTS)
+        text = random.choice(SAMPLE_TEXTS) + f" [{next(_counter)}]"
         self.client.post(
             "/moderate",
             json={"text": text, "max_new_tokens": 10},
