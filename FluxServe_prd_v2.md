@@ -35,7 +35,7 @@
 
 ### The one-sentence version
 
-A production-grade LLM inference server that serves Qwen 0.5B for content moderation, implementing continuous batching, KV cache management, INT8 quantization, backpressure, and Prometheus observability — benchmarked end-to-end with real throughput and latency numbers.
+A production-grade LLM inference server that serves Qwen 0.5B for content moderation, implementing continuous batching, KV cache management, FP16 inference, backpressure, and Prometheus observability — benchmarked end-to-end with real throughput and latency numbers.
 
 ### The longer version
 
@@ -49,7 +49,7 @@ This project builds the serving infrastructure that makes it production-viable:
 
 **KV cache management** is the memory optimization that makes transformer inference fast. During autoregressive generation, the model recomputes attention over all previous tokens at every step — this is quadratic in sequence length. KV caching stores the key and value tensors from previous steps so they don't need recomputation. You will implement a KV cache with a fixed memory budget and an eviction policy.
 
-**INT8 quantization** reduces the model's VRAM footprint by representing weights in 8-bit integers instead of 32-bit floats. On a GTX 1080 with 8GB VRAM, this is not optional — it's what makes Qwen 0.5B fit comfortably and leaves room for activations and the KV cache.
+**FP16 inference** runs model weights in 16-bit float precision. Qwen 0.5B in FP16 uses ~1GB VRAM on the GTX 1080, leaving ~7GB for the KV cache and activations — more than sufficient. INT8 quantization was benchmarked and rejected: the GTX 1080 (Pascal/sm_61) has no native INT8 tensor cores, so bitsandbytes falls back to a software path that is 3.4x slower than FP16 with no meaningful VRAM benefit at this model size. FP16 is the correct choice for this hardware.
 
 **Backpressure** is how servers degrade gracefully instead of crashing. When the inference queue is full, you return HTTP 429 instead of accepting more work than you can handle.
 
@@ -60,7 +60,7 @@ This project builds the serving infrastructure that makes it production-viable:
 - A FastAPI inference server with a `POST /moderate` endpoint
 - Continuous batching engine using asyncio.Queue + batch worker
 - KV cache with configurable memory budget and LRU eviction
-- INT8 quantization via `bitsandbytes`
+- FP16 inference (INT8 benchmarked and rejected — see `benchmarks/phase1_baseline.md`)
 - Backpressure via HTTP 429 when queue depth exceeds threshold
 - Prometheus metrics: tokens/sec, TTFT, TPOT, p50/p95/p99 latency, KV cache hit rate, batch size distribution, queue depth
 - Grafana dashboard wired to Prometheus for live visualization
@@ -148,7 +148,7 @@ For Qwen 0.5B (24 layers, 16 heads, 64 head_dim, FP16):
 ```
 2 × 24 × 16 × 64 × seq_len × 2 bytes = 98,304 × seq_len bytes
 ```
-At seq_len=512, that's ~50MB per sequence. On 8GB VRAM with the model taking ~1GB (INT8), you have ~7GB for KV cache — enough for ~140 concurrent sequences at seq_len=512.
+At seq_len=512, that's ~50MB per sequence. On 8GB VRAM with the model taking ~1GB (FP16), you have ~7GB for KV cache — enough for ~140 concurrent sequences at seq_len=512.
 
 **Your implementation:** You will maintain a fixed-size KV cache pool. When it's full and a new sequence needs space, you evict the oldest sequence (LRU). If a sequence was evicted and it comes back (cache miss), you rerun the prefill step to repopulate its KV cache.
 
@@ -173,21 +173,13 @@ LOOP every decode step:
 
 **Why this matters for throughput:** Continuous batching keeps GPU utilization near 100%. Static batching with mismatched sequence lengths can drop utilization below 50%.
 
-### 3.4 INT8 Quantization
+### 3.4 Precision — Why FP16
 
-Qwen 0.5B in full float32 precision takes ~2GB of VRAM. In float16 (FP16), ~1GB. In INT8, ~500MB.
+Qwen 0.5B in FP16 uses ~1GB VRAM, leaving ~7GB free on the GTX 1080 for the KV cache and activations.
 
-Quantization represents model weights using fewer bits. INT8 uses 8-bit integers instead of 32-bit floats. The tradeoff: slight accuracy loss in exchange for 2-4x memory reduction and faster matrix multiplications on supported hardware.
+INT8 quantization was benchmarked during Phase 1. On paper, INT8 halves VRAM and accelerates matrix multiplications — but only on hardware with native INT8 tensor cores (Turing/RTX 20xx and newer). The GTX 1080 is Pascal (sm_61) and has no INT8 tensor cores. `bitsandbytes` falls back to a software emulation path on Pascal, which ran at **499ms avg vs 146ms avg** for FP16 — a 3.4x slowdown with only 360MB VRAM saved. Full results in `benchmarks/phase1_baseline.md`.
 
-**Why it matters on a GTX 1080:** 8GB VRAM is tight. You need room for the model weights, the KV cache, activations during the forward pass, and PyTorch overhead. INT8 quantization is what makes this all fit.
-
-**Implementation options:**
-1. `bitsandbytes` library — the easiest path, wraps HuggingFace models with `load_in_8bit=True`
-2. `torch.quantization.quantize_dynamic` — PyTorch native, slightly more control
-
-Use `bitsandbytes` — it's one line and HuggingFace integrates with it natively.
-
-**What to benchmark:** Compare tokens/sec throughput and p95 latency between FP32, FP16, and INT8. This becomes a resume bullet.
+**Decision: use FP16 for all phases.** The `PRECISION` env var is removed. `model_loader.py` always loads in FP16.
 
 ### 3.5 Prefill vs Decode — Two Phases of Inference
 
@@ -255,7 +247,7 @@ Prometheus is a time-series metrics database. Your server exposes a `/metrics` e
 
 ### Why Qwen 0.5B
 
-- **Fits on a GTX 1080:** ~500MB in INT8, leaving 7.5GB for KV cache and activations
+- **Fits on a GTX 1080:** ~1GB in FP16, leaving ~7GB for KV cache and activations
 - **Fast decode:** Small model = fast forward pass = good latency numbers
 - **Capable enough for the task:** Binary classification (toxic/safe) is well within its capabilities
 - **Open weights:** Available on HuggingFace, no API key required
@@ -278,13 +270,8 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="cuda"
 )
 
-# INT8 — requires bitsandbytes
-# pip install bitsandbytes
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    load_in_8bit=True,
-    device_map="cuda"
-)
+# INT8 was benchmarked and rejected for GTX 1080 (Pascal/sm_61) — see benchmarks/phase1_baseline.md
+# Use FP16 (above) for all phases of this project.
 ```
 
 ### Prompt Template
@@ -415,7 +402,7 @@ Run this before anything else. If the model is getting basic cases wrong, fix th
                     ┌──────────────────▼──────────────────────┐
                     │            GPU Layer                     │
                     │                                          │
-                    │  Qwen 0.5B (FP16 or INT8)               │
+                    │  Qwen 0.5B (FP16)                        │
                     │  KV Cache (fixed VRAM budget)            │
                     │  PyTorch CUDA kernels                    │
                     └─────────────────────────────────────────┘
@@ -493,7 +480,7 @@ Run this before anything else. If the model is getting basic cases wrong, fix th
 {
   "status": "ok",
   "model": "qwen2.5-0.5b",
-  "precision": "int8",
+  "precision": "fp16",
   "queue_depth": 12,
   "active_sequences": 8,
   "kv_cache_utilization": 0.43,
@@ -528,7 +515,7 @@ fluxserve/
 │   ├── __init__.py
 │   ├── main.py               # FastAPI app, routes, middleware registration
 │   ├── models.py             # Pydantic request/response schemas
-│   ├── model_loader.py       # Load Qwen 0.5B, handle FP16 vs INT8
+│   ├── model_loader.py       # Load Qwen 0.5B in FP16, run_inference()
 │   ├── kv_cache.py           # KV cache pool, LRU eviction, hit/miss tracking
 │   ├── batch_worker.py       # Continuous batching loop, decode steps
 │   ├── queue_manager.py      # asyncio.Queue wrapper, backpressure logic
@@ -568,100 +555,44 @@ Build in this exact order. Do not skip ahead. Each phase produces something runn
 
 ---
 
-### Phase 1: Model Validation (Day 1)
+### Phase 1: Model Validation (Day 1) ✅ COMPLETE
 
-**Goal:** Qwen 0.5B runs on your GPU and produces correct moderation outputs.
+**Goal:** Qwen 0.5B runs on your GPU and produces correct moderation outputs. FP16 vs INT8 benchmarked. Precision decision made.
 
-**Do not build any server yet.** Just run the model directly.
+**Status: Done.** Results recorded in `benchmarks/phase1_baseline.md`.
+
+**Setup:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cu118  # required for GTX 1080 (sm_61)
+pip install transformers accelerate bitsandbytes fastapi uvicorn redis prometheus-client locust
+```
+
+> **GTX 1080 note:** The default PyTorch from PyPI targets sm_70+. Install from the cu118 index instead — it includes sm_61 kernels and works with the system's CUDA 12.x runtime.
+
+**Script:** `scripts/validate_model.py` — runs FP16 and INT8 back-to-back and prints a comparison table.
 
 ```bash
-pip install torch transformers accelerate bitsandbytes
+python scripts/validate_model.py
 ```
 
-```python
-# scripts/validate_model.py
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import time
+**Actual results:**
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+| Metric           |   FP16 |   INT8 |
+|------------------|-------:|-------:|
+| Accuracy         |   6/6  |   6/6  |
+| Avg latency (ms) |    146 |    499 |
+| Min latency (ms) |     75 |    373 |
+| Max latency (ms) |    329 |    638 |
+| VRAM (GB)        |   1.00 |   0.64 |
 
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+**Decision: use FP16 for all subsequent phases.** INT8 is 3.4x slower on the GTX 1080 (Pascal/sm_61 has no native INT8 tensor cores). VRAM savings are negligible at this model size. Full notes in `benchmarks/phase1_baseline.md`.
 
-print("Loading model (FP16)...")
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float16,
-    device_map="cuda"
-)
-model.eval()
-
-print(f"Model loaded. VRAM used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-
-SYSTEM_PROMPT = (
-    "You are a content moderation classifier. "
-    "Given a piece of text, determine if it is toxic or safe. "
-    "Toxic content includes hate speech, threats, harassment, and explicit harmful content. "
-    "Reply with exactly one word: 'toxic' or 'safe'."
-)
-
-def classify(text: str) -> tuple[str, float]:
-    prompt = (
-        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-        f"<|im_start|>user\n{text}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    start = time.time()
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=5,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-    latency = (time.time() - start) * 1000
-    generated = tokenizer.decode(
-        outputs[0][inputs.input_ids.shape[1]:],
-        skip_special_tokens=True
-    ).strip().lower()
-    label = "toxic" if "toxic" in generated else "safe" if "safe" in generated else "unknown"
-    return label, latency
-
-test_cases = [
-    ("I love this product, it is amazing!", "safe"),
-    ("I will hurt you if you do not comply", "toxic"),
-    ("The weather is nice today", "safe"),
-    ("You are worthless and should disappear", "toxic"),
-    ("This is a great community!", "safe"),
-    ("Go kill yourself", "toxic"),
-]
-
-print("\nRunning validation...")
-correct = 0
-for text, expected in test_cases:
-    label, latency = classify(text)
-    ok = label == expected
-    correct += ok
-    status = "✓" if ok else "✗"
-    print(f"  {status} [{latency:.0f}ms] Expected: {expected:5s} Got: {label:7s} | {text[:60]}")
-
-print(f"\nAccuracy: {correct}/{len(test_cases)}")
-print(f"VRAM after inference: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-```
-
-**Success criteria:** At least 5/6 correct, latency under 2000ms per request.
-
-**Also run with INT8:**
-```python
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    load_in_8bit=True,
-    device_map="cuda"
-)
-```
-Compare accuracy and latency. Record both numbers — they become your benchmark baseline.
+**✅ Phase 1 success criteria met:**
+- 6/6 accuracy on both precisions
+- FP16 avg latency 146ms (well under 2000ms threshold)
+- VRAM 1.00 GB (confirms FP16 fits with ~7GB headroom for KV cache)
 
 **✅ How to verify Phase 1 is done:**
 ```
@@ -733,18 +664,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
-PRECISION = os.getenv("PRECISION", "fp16")  # "fp16" or "int8"
 
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    if PRECISION == "int8":
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, load_in_8bit=True, device_map="cuda"
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.float16, device_map="cuda"
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, dtype=torch.float16, device_map="cuda"
+    )
     model.eval()
     return model, tokenizer
 
@@ -1545,133 +1470,103 @@ print(f'KV size for seq_len=10: {size / 1024:.1f} KB')
 
 ---
 
-### Phase 6: INT8 Quantization Benchmark (Day 6)
+### Phase 6: Single-Request Benchmark (Day 6)
 
-**Goal:** Quantify the throughput and latency impact of INT8 quantization.
+**Goal:** Establish a rigorous FP16 single-request baseline with p50/p95/p99 latency and tokens/sec — the "before continuous batching" numbers you will compare against in Phase 7.
 
-You already have the `load_in_8bit=True` option in `model_loader.py`. Now benchmark it properly.
+This is `scripts/benchmark.py`. It runs 50 timed requests sequentially against the model directly (no server, no queue), with 5 warmup runs to let CUDA fully initialize.
 
 ```python
 # scripts/benchmark.py
-"""
-Run this script to compare FP16 vs INT8 performance.
-No Locust needed — direct inference loop.
-"""
 import torch
 import time
-import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 TEST_TEXT = "I hate everything about this. You should all be ashamed."
 WARMUP_RUNS = 5
 BENCHMARK_RUNS = 50
+MAX_NEW_TOKENS = 10
 
-def benchmark(model, tokenizer, text: str, max_new_tokens: int = 10) -> list[float]:
-    prompt = (
-        f"<|im_start|>system\nYou are a content moderation classifier. "
-        f"Reply with exactly one word: toxic or safe.<|im_end|>\n"
+SYSTEM_PROMPT = (
+    "You are a content moderation classifier. "
+    "Reply with exactly one word: 'toxic' or 'safe'."
+)
+
+def build_prompt(text: str) -> str:
+    return (
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{text}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    latencies = []
 
-    # Warmup
-    for _ in range(WARMUP_RUNS):
-        with torch.no_grad():
-            model.generate(**inputs, max_new_tokens=max_new_tokens,
-                         do_sample=False, pad_token_id=tokenizer.eos_token_id)
-
-    # Benchmark
-    for _ in range(BENCHMARK_RUNS):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                    do_sample=False, pad_token_id=tokenizer.eos_token_id)
-        torch.cuda.synchronize()
-        end = time.perf_counter()
-        tokens = outputs.shape[1] - inputs.input_ids.shape[1]
-        latencies.append((end - start) * 1000)  # ms
-
-    return latencies
-
+print("Loading model (FP16)...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, dtype=torch.float16, device_map="cuda"
+)
+model.eval()
+print(f"VRAM used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
-for precision in ["fp16", "int8"]:
-    print(f"\n{'='*50}")
-    print(f"Benchmarking {precision.upper()}")
-    print(f"{'='*50}")
+inputs = tokenizer(build_prompt(TEST_TEXT), return_tensors="pt").to("cuda")
+latencies = []
+tokens_generated = []
 
-    if precision == "int8":
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, load_in_8bit=True, device_map="cuda"
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.float16, device_map="cuda"
-        )
-    model.eval()
+print(f"\nWarmup ({WARMUP_RUNS} runs)...")
+for _ in range(WARMUP_RUNS):
+    with torch.no_grad():
+        model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
+                       do_sample=False, pad_token_id=tokenizer.eos_token_id)
 
-    vram = torch.cuda.memory_allocated() / 1e9
-    print(f"VRAM used: {vram:.2f} GB")
+print(f"Benchmarking ({BENCHMARK_RUNS} runs)...")
+for _ in range(BENCHMARK_RUNS):
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
+                                 do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    torch.cuda.synchronize()
+    latencies.append((time.perf_counter() - start) * 1000)
+    tokens_generated.append(outputs.shape[1] - inputs.input_ids.shape[1])
 
-    latencies = benchmark(model, tokenizer, TEST_TEXT)
-    latencies.sort()
-    p50 = latencies[len(latencies)//2]
-    p95 = latencies[int(len(latencies)*0.95)]
-    p99 = latencies[int(len(latencies)*0.99)]
-    avg = sum(latencies)/len(latencies)
+latencies.sort()
+p50 = latencies[len(latencies) // 2]
+p95 = latencies[int(len(latencies) * 0.95)]
+p99 = latencies[int(len(latencies) * 0.99)]
+avg = sum(latencies) / len(latencies)
+avg_tokens = sum(tokens_generated) / len(tokens_generated)
 
-    print(f"Latency (ms): p50={p50:.1f} p95={p95:.1f} p99={p99:.1f} avg={avg:.1f}")
-    print(f"Throughput: {1000/avg:.1f} requests/sec")
-
-    del model
-    torch.cuda.empty_cache()
+print(f"\n{'='*50}")
+print(f"FP16 Single-Request Benchmark (sequential, no server)")
+print(f"{'='*50}")
+print(f"VRAM used:        {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+print(f"Avg tokens/req:   {avg_tokens:.1f}")
+print(f"Latency p50:      {p50:.1f} ms")
+print(f"Latency p95:      {p95:.1f} ms")
+print(f"Latency p99:      {p99:.1f} ms")
+print(f"Latency avg:      {avg:.1f} ms")
+print(f"Throughput:       {1000/avg:.2f} req/sec")
+print(f"Tokens/sec:       {avg_tokens * 1000/avg:.2f}")
+print(f"{'='*50}")
+print("\nRecord these numbers in benchmarks/phase6_single_request.md")
+print("These are your pre-batching baseline for the Phase 7 comparison.")
 ```
 
-Record these numbers. They become your resume bullets.
+```bash
+python scripts/benchmark.py
+```
+
+After running, save the output to `benchmarks/phase6_single_request.md`. This is your baseline. After Phase 7 (Locust load test with continuous batching), you will compute the improvement multiplier.
 
 **✅ How to verify Phase 6 is done:**
-```bash
-# 1. Run the benchmark script directly
-python scripts/benchmark.py
+- Script runs without error
+- `p95 latency < 1000ms` for sequential single requests
+- `throughput > 1.0 req/sec`
+- Numbers saved in `benchmarks/phase6_single_request.md`
 
-# Expected output format:
-# ==================================================
-# Benchmarking FP16
-# ==================================================
-# VRAM used: 1.02 GB
-# Latency (ms): p50=480.2 p95=510.1 p99=521.3 avg=485.0
-# Throughput: 2.1 requests/sec
-#
-# ==================================================
-# Benchmarking INT8
-# ==================================================
-# VRAM used: 0.54 GB
-# Latency (ms): p50=495.1 p95=525.3 p99=538.7 avg=500.2
-# Throughput: 2.0 requests/sec
+**If latency is above 2000ms:** CUDA is not active — check `device_map="cuda"` and that `torch.cuda.is_available()` returns True.
 
-# 2. Verify INT8 accuracy hasn't degraded
-# Re-run validate_model.py with INT8 model — should still be 5/6 or 6/6
-PRECISION=int8 python scripts/validate_model.py
-
-# 3. Record the VRAM delta — this is your resume number
-# "Reduced VRAM from X GB to Y GB" — should be roughly 2x reduction
-
-# 4. Verify the server still works end-to-end with INT8
-PRECISION=int8 uvicorn app.main:app --host 0.0.0.0 --port 8000
-curl -X POST http://localhost:8000/moderate \
-  -H "Authorization: Bearer dev-key" \
-  -H "Content-Type: application/json" \
-  -d '{"text": "You are terrible"}'
-# Expected: {"label":"toxic","flagged":true,...}
-```
-
-**If INT8 accuracy drops below 4/6:** The GTX 1080 may have issues with bitsandbytes INT8 on Pascal architecture. Fall back to `torch.quantization.quantize_dynamic` as an alternative, or use FP16 only and note INT8 as a known limitation.
-
-**If VRAM doesn't decrease with INT8:** `load_in_8bit=True` requires bitsandbytes to be correctly installed with CUDA support. Run `python -c "import bitsandbytes; print(bitsandbytes.__version__)"` to verify. If it fails, reinstall: `pip install bitsandbytes --upgrade`.
+**If throughput seems low:** This is expected — sequential single-request inference does not use the GPU efficiently. Continuous batching in Phase 7 is what fixes this.
 
 ---
 
@@ -2039,7 +1934,7 @@ Before you write the resume bullets, you need these numbers from real runs:
 2. **p50/p95/p99 latency under 8 concurrent users**
 3. **TTFT (Time To First Token)** — p50 and p95, measures prefill performance
 4. **TPOT (Time Per Output Token)** — p50 and p95, measures decode step performance
-5. **FP16 vs INT8 latency and VRAM difference**
+5. **FP16 single-request p50/p95 latency (Phase 6 baseline)**
 6. **KV cache hit rate** (what percentage of prefill steps were skipped)
 7. **Tokens/sec throughput** at peak load
 8. **Maximum sustainable RPS** before 429s start appearing
@@ -2068,7 +1963,6 @@ These are approximate targets for Qwen 0.5B on a GTX 1080. Your numbers may diff
 | p50 latency (8 users) | 200-800ms |
 | p95 latency (8 users) | 500-2000ms |
 | VRAM (FP16) | ~1.0 GB |
-| VRAM (INT8) | ~0.5 GB |
 | KV cache hit rate | 5-20% (depends on repeat queries) |
 
 ---
@@ -2081,7 +1975,7 @@ These are approximate targets for Qwen 0.5B on a GTX 1080. Your numbers may diff
 
 **Exact-match Redis cache vs semantic cache:** Exact match is appropriate here because moderation requests for the same text should always return the same result. Semantic caching (like NeuralGate's pgvector approach) would be overkill and could return cached results for semantically similar but meaningfully different inputs.
 
-**FP16 vs INT8:** FP16 is the default — good balance of speed and accuracy, fits on 8GB VRAM with room to spare. INT8 halves memory usage and is faster on hardware with INT8 acceleration (the GTX 1080 does not have Tensor cores, so the speedup is limited). Benchmark both and let the numbers decide.
+**FP16 only:** INT8 was benchmarked in Phase 1 and rejected. The GTX 1080 (Pascal/sm_61) has no native INT8 tensor cores — bitsandbytes falls back to a 3.4x slower software path. FP16 at ~1GB VRAM leaves ~7GB for the KV cache, which is sufficient. See `benchmarks/phase1_baseline.md`.
 
 **In-process KV cache vs external cache:** Storing past_key_values in GPU memory (in-process) is the standard approach. An external KV cache would require serializing tensors to CPU/disk and deserializing them — slower than just rerunning prefill for cache misses. In-process is correct here.
 
@@ -2105,9 +1999,9 @@ These are approximate targets for Qwen 0.5B on a GTX 1080. Your numbers may diff
 
 "Naive sequential inference handled about X req/sec at Y ms p95 latency. With continuous batching, throughput improved to Z req/sec — roughly Ax improvement — because the GPU was processing multiple sequences simultaneously instead of waiting for one to finish before starting the next. The batch worker runs decode steps for all active sequences in the same PyTorch call, so the GPU is never idle between requests."
 
-**"How does INT8 quantization affect accuracy?"**
+**"Did you consider INT8 quantization?"**
 
-"I benchmarked FP16 vs INT8 on a validation set of known toxic/safe examples. Accuracy dropped from X% to Y% — less than 1 percentage point in my tests. The memory reduction was from ~1GB to ~500MB VRAM for the model weights. On a GTX 1080 without Tensor cores, the latency improvement from INT8 was modest — about Z ms per request — but the memory savings matter more: the freed VRAM goes to the KV cache, allowing more concurrent sequences."
+"Yes — I benchmarked it in Phase 1 before writing any server code. Both FP16 and INT8 hit 6/6 accuracy on my validation set. On the GTX 1080 (Pascal/sm_61), INT8 averaged 499ms vs 146ms for FP16 — a 3.4x slowdown — because Pascal has no native INT8 tensor cores and bitsandbytes falls back to software emulation. The VRAM savings were only 360MB against 7GB of headroom. I chose FP16 and moved on."
 
 **"How do you handle backpressure?"**
 
@@ -2123,7 +2017,7 @@ Fill in the [X] values after running your benchmarks.
 
 - Built a production LLM inference server serving Qwen 0.5B, implementing continuous batching via asyncio.Queue to achieve [X]x throughput improvement over naive sequential inference at [N] concurrent users, reaching [Y] tokens/sec on a GTX 1080
 - Designed a KV cache with LRU eviction and [Z]GB VRAM budget, reducing per-decode-step compute from O(N²) to O(N) and achieving a [W]% cache hit rate across [N] concurrent sequences
-- Quantized the model to INT8 using bitsandbytes, reducing VRAM from [A]GB to [B]GB and improving p95 latency from [C]ms to [D]ms with less than 1% accuracy degradation on validation set
+- Benchmarked FP16 vs INT8 quantization; selected FP16 after measuring INT8 was 3.4x slower on GTX 1080 (Pascal/sm_61 lacks native INT8 tensor cores), establishing p50=[X]ms / p95=[Y]ms / [Z] tokens/sec single-request baseline before adding continuous batching
 - Instrumented TTFT (p50: [X]ms), TPOT (p50: [Y]ms/token), p50/p95/p99 end-to-end latency, and tokens/sec via Prometheus with Grafana dashboards; implemented backpressure at 256-item queue depth (HTTP 429); containerized with Docker Compose and deployed on Kubernetes (minikube) with HPA autoscaling 1→4 replicas
 
 ---
